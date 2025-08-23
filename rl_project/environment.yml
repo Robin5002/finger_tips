@@ -1,0 +1,18 @@
+name: rl_mujoco_playground
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - mujoco=3.3.2
+  - matplotlib=3.8.4
+  - opencv=4.9.0
+  - pyglet
+  - jupyterlab
+  - ipywidgets
+  - pip
+  - pip:
+    - gymnasium
+    - -e .
+variables:
+  PYTHONPATH: "${CONDA_PREFIX}/mujoco_tutorial:${PYTHONPATH}"

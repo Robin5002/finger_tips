@@ -1,0 +1,46 @@
+# RL Environment Dependencies
+gymnasium==0.28.1
+mujoco==3.3.2
+gym==0.23.1
+
+# PyTorch with CUDA 11.8 support (compatible with GTX 1050)
+torch==2.0.1+cu118
+torchvision==0.15.2+cu118
+torchaudio==2.0.2+cu118
+
+# Core ML/RL packages
+numpy==1.26.4
+stable-baselines3==2.0.0
+wandb==0.13.11
+tensorboard==2.20.0
+
+# Video/Media processing
+imageio==2.37.0
+imageio-ffmpeg==0.6.0
+moviepy==1.0.3
+opencv-python==4.9.0
+
+# CleanRL specific
+tyro==0.5.18
+rich==11.2.0
+
+# Hyperparameter optimization
+optuna==4.5.0
+
+# Development tools
+jupyter
+jupyterlab==4.4.5
+matplotlib==3.8.4
+pandas==2.3.1
+seaborn
+
+# Utilities
+tqdm==4.67.1
+pyyaml==6.0.2
+cloudpickle==3.1.1
+psutil==7.0.0
+
+# Graphics and rendering
+pygame==2.1.0
+pyglet==2.1.6
+PyOpenGL==3.1.9
