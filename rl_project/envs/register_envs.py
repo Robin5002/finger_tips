@@ -1,24 +1,16 @@
-"""
-Register custom environments with Gymnasium.
-"""
-
 import gymnasium as gym
+from envs.finger_env import FingerPushEnv
 
-# Import available environment classes
-try:
-    from envs.finger_env import FingerPushEnv
-    print("✅ Successfully imported FingerPushEnv")
-except ImportError as e:
-    print(f"⚠️ finger_env not found: {e}")
-    FingerPushEnv = None
+# Standard variant: allow rolling
+gym.register(
+    id="FingerPush-v0",
+    entry_point="envs.finger_env:FingerPushEnv",
+    kwargs={"no_roll": False},
+)
 
-# Register environments that are available
-if FingerPushEnv is not None:
-    gym.register(
-        id='FingerPush-v0',
-        entry_point='envs.finger_env:FingerPushEnv',
-        max_episode_steps=2400,
-    )
-    print("✅ Registered FingerPush-v0 environment")
-
-print("✅ Environment registration completed") 
+# No-roll constraint variant
+gym.register(
+    id="FingerPushNoRoll-v0",
+    entry_point="envs.finger_env:FingerPushEnv",
+    kwargs={"no_roll": True},
+)

@@ -17,8 +17,37 @@ class FingerPushEnv(gym.Env):
     def __init__(self,
                  xml_path: str = "../robot_description/finger_edu_description/xml/finger_edu_scene_cube.xml",
                  render_mode: Optional[str] = None,
-                 log_dir: Optional[str] = None):
+                 log_dir: Optional[str] = None,
+                 no_roll: bool = False):
         super().__init__()
+
+        self.no_roll = no_roll
+        # Max allowed orientation deviation (degrees) for no-roll success (override via NOROLL_MAX_DEG)
+        self.no_roll_max_deg = float(os.getenv("NOROLL_MAX_DEG", "5.0"))
+
+        # Curriculum toggle (set EASY_CURRICULUM=1 in the environment)
+        self.curriculum = os.getenv("EASY_CURRICULUM", "0") == "1"
+
+        # --- Automatic curriculum (works even if EASY_CURRICULUM=0) ---
+        self.auto_curriculum = os.getenv("AUTO_CURRICULUM", "1") == "1"
+        # Offsets in meters
+        self.easy_target_offset = float(os.getenv("TARGET_OFFSET_EASY", "0.12"))
+        self.hard_target_offset = float(os.getenv("TARGET_OFFSET_HARD", "0.20"))
+        # Success radii in meters
+        self.easy_success_radius = float(os.getenv("SUCCESS_RADIUS_EASY", "0.08"))
+        self.hard_success_radius = float(os.getenv("SUCCESS_RADIUS_HARD", "0.05"))
+        # Number of episodes over which to linearly anneal from easy→hard
+        self.curriculum_episodes = int(os.getenv("CURRICULUM_EPISODES", "300" if self.curriculum else "600"))
+
+        # --- Performance-based curriculum (advances only when success rate is high) ---
+        from collections import deque
+        self.curriculum_mode = os.getenv("AUTO_CURRICULUM_MODE", "performance")  # "performance" or "linear"
+        self.recent_successes = deque(maxlen=int(os.getenv("CURRICULUM_WINDOW", "50")))
+        self.curriculum_progress = 0.0  # 0.0=easiest, 1.0=hardest
+        self.curr_step_up = float(os.getenv("CURRICULUM_STEP_UP", "0.05"))
+        self.curr_step_down = float(os.getenv("CURRICULUM_STEP_DOWN", "0.02"))
+        self.curr_up_threshold = float(os.getenv("CURRICULUM_UP_THRESH", "0.6"))   # advance when SR >= 60%
+        self.curr_down_threshold = float(os.getenv("CURRICULUM_DOWN_THRESH", "0.2"))  # relax when SR <= 20%
 
         # TensorBoard logging setup
         self.writer = None
@@ -61,13 +90,20 @@ class FingerPushEnv(gym.Env):
         self.joint_lower = np.array(lows, dtype=np.float32)
         self.joint_upper = np.array(highs, dtype=np.float32)
 
+        # Actions are *normalized deltas* in [-1, 1] around a nominal pose
         self.action_space = spaces.Box(
             low=-np.ones(self.num_dof, dtype=np.float32),
             high=np.ones(self.num_dof, dtype=np.float32),
             shape=(self.num_dof,),
-            dtype=np.float32
+            dtype=np.float32,
         )
         self.prev_action = np.zeros(self.num_dof, dtype=np.float32)
+
+        # Per-joint delta amplitude (fraction of span); curriculum keeps it gentler unless overridden
+        span = (self.joint_upper - self.joint_lower).astype(np.float32)
+        default_frac = 0.20 if self.curriculum else 0.30
+        delta_frac = float(os.getenv("DELTA_FRAC", str(default_frac)))
+        self.delta_scale = float(delta_frac) * span
 
         # ---------- Cube setup ----------
         free_joint_ids = np.where(self.model.jnt_type == mujoco.mjtJoint.mjJNT_FREE)[0]
@@ -80,27 +116,69 @@ class FingerPushEnv(gym.Env):
 
         adr_q = int(self.jnt_qposadr[self.cube_free_jid])
         cube_qpos = self.data.qpos[adr_q:adr_q + 7]
-        cube_pos_xyz = cube_qpos[4:7]
-        self.cube_init_pos = cube_pos_xyz[:2].copy()
+        # MuJoCo free joint qpos layout: [x, y, z, qw, qx, qy, qz]
+        cube_pos_xyz = cube_qpos[0:3]
 
-        # Target is very close to make task achievable
-        self.target_pos_xy = self.cube_init_pos + np.array([0.20, 0.0], dtype=np.float32)  # Only 20cm away!
-        # Change to different direction (e.g., 15cm at 45 degrees):
-        self.target_pos_xy = self.cube_init_pos + np.array([0.106, 0.106], dtype=np.float32)
+        self.cube_init_pos = cube_pos_xyz[:2].copy()
+        # Target will be set at each reset: forward (+x) from the cube start
+        self.forward_axis = np.array([1.0, 0.0], dtype=np.float32)  # +x unit vector
+        # These will be set per-reset via curriculum schedule
+        self.target_offset = None
+        self.target_pos_xy = None
+        self.success_radius = None
         self.reach_goal_timer = 0
-        self.reach_goal_threshold = 100
+        # Success hold in *sim* steps; can override via env var
+        self.reach_goal_threshold = int(os.getenv("SUCCESS_HOLD_SIMSTEPS", str(4 if self.curriculum else 10)))
+        # Agent-step based hold (robust with decimation)
+        self.goal_hold_agent_steps = 0
+        # Require N consecutive agent steps within success radius (override via HOLD_AGENT_THRESHOLD)
+        self.hold_agent_threshold = int(os.getenv("HOLD_AGENT_THRESHOLD", "1"))
+        # Velocity tolerance to consider the cube "settled" near goal (m/s)
+        self.vel_success_tol = float(os.getenv("VEL_SUCCESS_TOL", "0.06"))
+        self.angvel_success_tol = float(os.getenv("ANGVEL_SUCCESS_TOL", "0.5"))
+        self.eval_disable_success_term = os.getenv("EVAL_DISABLE_SUCCESS_TERMINATION", "0") == "1"
+        # Last termination cause string for logging in infos (no printing by default)
+        self._last_done_cause = None  # one of {"success","time_limit","oob", None}
 
         # ---------- Controller parameters ----------
-        self.kp = 20.0  # Very strong PD gain for precise control
-        self.kd = 1.0   # Good damping
-        self.action_scale = 1.0  # More conservative actions
+        self.kp = 2.0   # Position gain (prof spec)
+        self.kd = 0.1   # Velocity gain (prof spec)
+        self.action_scale = 1.0  # base
+        if self.curriculum:
+            self.kp = 4.0
+            self.kd = 0.2
+            self.action_scale = 1.2
+        else:
+            # a bit more authority on hard mode so the cube can travel 0.20 m reliably
+            self.action_scale = 1.2
+        # Optional overrides from environment variables
+        self.kp = float(os.getenv("KP", str(self.kp)))
+        self.kd = float(os.getenv("KD", str(self.kd)))
+        self.action_scale = float(os.getenv("ACTION_SCALE", str(self.action_scale)))
         self.default_joint_pos = np.array([0.0, 0.5, -0.75], dtype=np.float32)[: self.num_dof]
         self.decimation = 4
 
+        # --- Reward coefficient overrides ---
+        self.success_bonus = float(os.getenv("SUCCESS_BONUS", "150.0" if not self.curriculum else "80.0"))
+        self.stay_near_bonus = float(os.getenv("STAY_NEAR_BONUS", "3.0" if not self.curriculum else "1.5"))
+        self.time_penalty_coef = float(os.getenv("TIME_PENALTY_COEF", "0.005" if not self.curriculum else "0.01"))
+
         # ---------- Episode settings ----------
-        self.episode_length = 30  # Even more time per episode
-        self.steps_per_episode = int(self.episode_length / (self.model.opt.timestep * self.decimation))
+        # Longer horizon in hard mode helps complete 0.20 m pushes; override via EPISODE_SECONDS
+        self.episode_length = float(os.getenv("EPISODE_SECONDS", "2.0" if self.curriculum else "4.0"))
+        # Count both sim steps and agent steps (agent acts every `decimation` simsteps)
+        self.sim_steps_per_episode = int(self.episode_length / self.model.opt.timestep)
+        self.agent_steps_per_episode = max(1, int(self.sim_steps_per_episode / max(1, self.decimation)))
+        # Expose agent-steps horizon for outside debuggers
+        self.steps_per_episode = self.agent_steps_per_episode
         self.current_step = 0
+
+        # Curriculum-sensitive shaping knobs
+        self.lateral_coef = -1.0   # gentler in hard mode so it doesn't fight forward pushing
+        self.init_xy_jitter = 0.06  # reduce lateral spawn spread in hard mode for reachability
+        if self.curriculum:
+            self.lateral_coef = -0.5
+            self.init_xy_jitter = 0.05
 
         # ---------- Observation space ----------
         obs_dim = 2 * self.num_dof + 13 + 2 + self.num_dof
@@ -115,11 +193,14 @@ class FingerPushEnv(gym.Env):
             self.viewer = mujoco.Renderer(self.model)
 
     def step(self, action: np.ndarray):
+        # Keep legacy simstep-based hold counter for metrics
         self._check_goal_progress()
+        # Count *agent* steps
         self.current_step += 1
 
         processed_action = self._process_action(action)
 
+        # Advance simulation with decimation
         for _ in range(self.decimation):
             self._apply_action(processed_action)
             mujoco.mj_step(self.model, self.data)
@@ -127,28 +208,100 @@ class FingerPushEnv(gym.Env):
             if self.render_mode == "human" and self.viewer is not None:
                 self.render()
 
+        # --- Compute instantaneous success at the agent-step boundary ---
+        adr_q = int(self.jnt_qposadr[self.cube_free_jid])
+        free_qpos = self.data.qpos[adr_q:adr_q + 7]
+        free_qvel = self.data.qvel[int(self.jnt_dofadr[self.cube_free_jid]):int(self.jnt_dofadr[self.cube_free_jid]) + 6]
+        # MuJoCo: qpos=[x,y,z, qw,qx,qy,qz], qvel=[vx,vy,vz, wx,wy,wz]
+        cube_pos = free_qpos[0:3].astype(np.float32)
+        cube_quat = free_qpos[3:7].astype(np.float32)
+        cube_xy = cube_pos[:2]
+        cube_linvel = free_qvel[0:3].astype(np.float32)
+        cube_angvel = free_qvel[3:6].astype(np.float32)
+        dist_to_target = float(np.linalg.norm(cube_xy - self.target_pos_xy))
+        success_flag = dist_to_target < self.success_radius
+        orientation_deg = 0.0
+        if self.no_roll:
+            angle = self._quat_angle(self.init_quat, cube_quat)
+            orientation_deg = float(np.rad2deg(angle))
+            success_flag = success_flag and (angle < np.deg2rad(self.no_roll_max_deg))
+
+        # Update *agent-step* hold timer (robust to decimation jitter)
+        if success_flag:
+            self.goal_hold_agent_steps += 1
+        else:
+            self.goal_hold_agent_steps = 0
+
+        # Held in agent steps and/or in raw sim steps
+        success_held_agent = (self.goal_hold_agent_steps >= self.hold_agent_threshold)
+        success_held_sim = (self.reach_goal_timer >= self.reach_goal_threshold)
+        # Unified held flag
+        success_held = bool(success_held_agent or success_held_sim)
+
+        # Prepare observation and reward
         next_obs = self._get_obs()
         reward_dict = self._get_reward()
         total_reward = float(sum(reward_dict.values()))
-        terminated, truncated = self._get_dones()
 
+        # Termination / truncation (override with success-held if necessary)
+        terminated, truncated = self._get_dones()
+        if success_held and not self.eval_disable_success_term:
+            terminated = True
+            self._last_done_cause = "success"
+
+        # Ensure time-limit truncation at the environment level as a hard guard
+        if not terminated and not truncated and (self.current_step >= self.agent_steps_per_episode):
+            truncated = True
+            self._last_done_cause = "time_limit"
+
+        # Info dict for debugging/metrics
+        info_dict = {
+            "reward_dict": reward_dict,
+            # Report unified success (held by either criterion) for training metrics
+            "success": bool(success_held),
+            "success_flag": bool(success_flag),
+            "success_held": bool(success_held),
+            "dist_to_target": dist_to_target,
+            "hold_steps": int(self.goal_hold_agent_steps),
+        }
+        if self.no_roll:
+            info_dict["orientation_deg"] = orientation_deg
+            # also expose whether sim-step criterion is active
+        info_dict["sim_held"] = bool(success_held_sim)
+
+        # Attach done_cause if episode ended
+        if terminated or truncated:
+            info_dict["done_cause"] = self._last_done_cause
+
+        # Save previous *normalized* action in [-1,1] for observations
         self.prev_action = np.clip(action, -1.0, 1.0).astype(np.float32)
 
-        # Update episode tracking
+        # Episode accounting
         self.episode_reward_sum += total_reward
         self.episode_step_count += 1
-
         if terminated or truncated:
             if self.writer:
                 for k, v in reward_dict.items():
                     self.writer.add_scalar(f"reward_components/{k}", v, self.episode_counter)
                 self.writer.add_scalar("episode/total_reward", self.episode_reward_sum, self.episode_counter)
                 self.writer.add_scalar("episode/length", self.episode_step_count, self.episode_counter)
+            # Update performance-based curriculum using outcome of this episode
+            try:
+                self.recent_successes.append(bool(success_held))
+                if self.curriculum_mode == "performance" and self.auto_curriculum:
+                    sr = float(np.mean(self.recent_successes)) if len(self.recent_successes) > 0 else 0.0
+                    if sr >= self.curr_up_threshold:
+                        self.curriculum_progress = min(1.0, self.curriculum_progress + self.curr_step_up)
+                    elif sr <= self.curr_down_threshold:
+                        self.curriculum_progress = max(0.0, self.curriculum_progress - self.curr_step_down)
+            except Exception:
+                pass
+
             self.episode_counter += 1
             self.episode_reward_sum = 0.0
             self.episode_step_count = 0
 
-        return next_obs, total_reward, terminated, truncated, {"reward_dict": reward_dict}
+        return next_obs, total_reward, terminated, truncated, info_dict
 
     def _get_obs(self):
         q_list, qd_list = [], []
@@ -165,10 +318,11 @@ class FingerPushEnv(gym.Env):
         free_qpos = self.data.qpos[adr_q:adr_q + 7]
         free_qvel = self.data.qvel[adr_v:adr_v + 6]
 
-        cube_quat = free_qpos[0:4].astype(np.float32)
-        cube_pos = free_qpos[4:7].astype(np.float32)
-        cube_angvel = free_qvel[0:3].astype(np.float32)
-        cube_linvel = free_qvel[3:6].astype(np.float32)
+        # Correct MuJoCo layout
+        cube_pos = free_qpos[0:3].astype(np.float32)
+        cube_quat = free_qpos[3:7].astype(np.float32)
+        cube_linvel = free_qvel[0:3].astype(np.float32)
+        cube_angvel = free_qvel[3:6].astype(np.float32)
 
         target_xy = self.target_pos_xy.astype(np.float32)
 
@@ -176,88 +330,130 @@ class FingerPushEnv(gym.Env):
                              dtype=np.float32)
         return obs
 
+
+    def _quat_angle(self, q1: np.ndarray, q2: np.ndarray) -> float:
+        """Absolute rotation angle between orientations q1 and q2 (MuJoCo quats are [w,x,y,z])."""
+        dot = float(np.dot(q1, q2))
+        dot = max(-1.0, min(1.0, abs(dot)))
+        return 2.0 * np.arccos(dot)
     def _get_reward(self):
         adr_q = int(self.jnt_qposadr[self.cube_free_jid])
-        cube_pos = self.data.qpos[adr_q + 4:adr_q + 7]
+        adr_v = int(self.jnt_dofadr[self.cube_free_jid])
+
+        free_qpos = self.data.qpos[adr_q:adr_q + 7]
+        free_qvel = self.data.qvel[adr_v:adr_v + 6]
+
+        cube_pos = free_qpos[0:3].astype(np.float32)
+        cube_quat = free_qpos[3:7].astype(np.float32)
         cube_xy = cube_pos[:2]
+        cube_linvel = free_qvel[0:3].astype(np.float32)
+        cube_angvel = free_qvel[3:6].astype(np.float32)
+
+        # Forward velocity shaping along +x (encourages continuous push)
+        vel_forward = float(np.dot(cube_linvel[:2], self.forward_axis))
+
         dist_to_target = float(np.linalg.norm(cube_xy - self.target_pos_xy))
-        
+
         rewards = {}
-        
-        # 1. MAIN REWARD: Simple dense reward based on negative distance
-        # The closer to target, the higher the reward
-        max_dist = 0.3  # Maximum possible distance in our setup
-        distance_reward = (max_dist - dist_to_target) / max_dist  # 0 to 1 scale
-        rewards["distance"] = distance_reward * 10.0  # Scale to 0-10
-        
-        # 2. SUCCESS BONUS: Large reward for being very close to target
-        success_threshold = 0.05  # 5cm threshold
-        if dist_to_target < success_threshold:
-            rewards["success"] = 50.0  # Big bonus for success
+
+        # 1) Dense distance shaping (penalize distance directly; removes positive baseline at start)
+        rewards["distance"] = -5.0 * dist_to_target
+
+        # 2) Lateral penalty (keep path straight)
+        lateral_err = float(abs((cube_xy - self.target_pos_xy)[1]))
+        rewards["lateral"] = float(self.lateral_coef) * lateral_err
+
+        # 3) Forward progress along +x toward the target (positive only)
+        # Use the vector from cube -> target so that moving forward (increasing cube_x) DECREASES this projection
+        proj = float(np.dot((self.target_pos_xy - cube_xy), self.forward_axis))
+        if hasattr(self, "prev_proj"):
+            rewards["forward_progress"] = 10.0 * max(0.0, self.prev_proj - proj)
         else:
-            rewards["success"] = 0.0
-            
-        # 3. CONTACT REWARD: Encourage finger to touch cube
+            rewards["forward_progress"] = 0.0
+        self.prev_proj = proj
+        # 3b) Reward for velocity toward the target (continuous incentive to keep pushing)
+        rewards["vel_towards"] = 5.0 * max(0.0, vel_forward)
+
+        # 4) Contact encouragement (robust to missing site)
         contact_reward = 0.0
         try:
             fingertip_site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "finger_tip")
             if fingertip_site_id != -1:
                 fingertip_pos = self.data.site_xpos[fingertip_site_id][:2]
                 fingertip_to_cube = np.linalg.norm(fingertip_pos - cube_xy)
-                if fingertip_to_cube < 0.03:  # Very close contact
+                if fingertip_to_cube < 0.03:
                     contact_reward = 5.0
-                elif fingertip_to_cube < 0.05:  # Near contact
+                elif fingertip_to_cube < 0.05:
                     contact_reward = 2.0
         except Exception:
             pass
         rewards["contact"] = contact_reward
-        
-        # 4. SIMPLE PROGRESS REWARD
+
+        # 5) Success bonus (use unified success radius)
+        rewards["success"] = self.success_bonus if dist_to_target < self.success_radius else 0.0
+        # 5b) Stay-near reward (encourage holding the goal region)
+        rewards["stay_near"] = self.stay_near_bonus if dist_to_target < self.success_radius else 0.0
+
+        # 6) Efficiency
+        rewards["action_penalty"] = -0.01 * np.sum(np.square(self.prev_action))
+        rewards["time_penalty"] = -float(self.time_penalty_coef)
+
+        # 7) No-roll shaping if enabled
+        if self.no_roll:
+            angle = self._quat_angle(self.init_quat, cube_quat)  # radians
+            rewards["no_roll_penalty"] = -5.0 * (angle ** 2)
+            rewards["angvel_penalty"] = -0.05 * float(np.dot(cube_angvel, cube_angvel))
+
+        # 8) Euclidean progress (non-negative)
         if hasattr(self, 'prev_dist'):
-            progress = max(0, self.prev_dist - dist_to_target)  # Only positive progress
-            rewards["progress"] = progress * 20.0  # Reward for getting closer
+            progress = max(0.0, self.prev_dist - dist_to_target)
+            rewards["progress"] = 20.0 * progress
         else:
             rewards["progress"] = 0.0
-            
-        # 5. Small penalties to encourage efficiency
-        rewards["action_penalty"] = -0.01 * np.sum(np.square(self.prev_action))
-        rewards["time_penalty"] = -0.01  # Small time penalty
-        
-        # Update for next step
+
         self.prev_dist = dist_to_target
-        
         return rewards
 
     def _get_dones(self):
-        # Episode ends when time limit reached
-        terminated = self.current_step >= self.steps_per_episode
-        
-        # Early termination if task is successfully completed and maintained
-        adr_q = int(self.jnt_qposadr[self.cube_free_jid])
-        cube_pos = self.data.qpos[adr_q + 4:adr_q + 7]
-        cube_xy = cube_pos[:2]
-        dist = float(np.linalg.norm(cube_xy - self.target_pos_xy))
-        
-        # Success: cube at target for several consecutive steps
-        if dist < 0.03:
-            self.reach_goal_timer += 1
-        else:
-            self.reach_goal_timer = 0
-            
-        # Terminate early if goal maintained for enough steps
-        success_termination = self.reach_goal_timer >= 10  # Hold for 10 steps
-        
-        # Also terminate if cube goes too far out of bounds
-        cube_out_of_bounds = (np.abs(cube_xy).max() > 0.3)  # 30cm from origin
-        
-        truncated = success_termination or cube_out_of_bounds
-        
-        return bool(terminated), bool(truncated)
+        # Time-limit in *agent* steps
+        time_limit_reached = self.current_step >= self.agent_steps_per_episode
 
-    def _process_action(self, action: np.ndarray):
-        a = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
-        target = self.default_joint_pos + self.action_scale * a
-        target = np.clip(target, self.joint_lower, self.joint_upper)
+        # Success if held for N consecutive agent steps, or for a number of raw sim steps
+        success_held_agent = self.goal_hold_agent_steps >= self.hold_agent_threshold
+        success_held_sim = self.reach_goal_timer >= self.reach_goal_threshold
+        success_held = bool(success_held_agent or success_held_sim)
+
+        # Out-of-bounds truncation based on cube XY
+        adr_q = int(self.jnt_qposadr[self.cube_free_jid])
+        cube_xy = self.data.qpos[adr_q + 0:adr_q + 2]
+        cube_out_of_bounds = (np.abs(cube_xy).max() > 0.3)
+
+        terminated = bool(success_held) and (not self.eval_disable_success_term)
+        truncated = bool(time_limit_reached or cube_out_of_bounds)
+
+        # Record cause for one-line info (no prints here)
+        if terminated:
+            self._last_done_cause = "success"
+        elif time_limit_reached:
+            self._last_done_cause = "time_limit"
+        elif cube_out_of_bounds:
+            self._last_done_cause = "oob"
+        else:
+            self._last_done_cause = None
+
+        return terminated, truncated
+
+    def _process_action(self, action: np.ndarray) -> np.ndarray:
+        a = np.asarray(action, dtype=np.float32)
+        # clamp to normalized range
+        a = np.clip(a, -1.0, 1.0)
+        # ensure correct shape
+        if a.shape[0] != self.num_dof:
+            a = np.resize(a, (self.num_dof,)).astype(np.float32)
+        # map to absolute targets around default pose
+        target = self.default_joint_pos + (self.action_scale * a * self.delta_scale)
+        # final safety clip to limits
+        target = np.clip(target.astype(np.float32), self.joint_lower, self.joint_upper)
         return target
 
     def _apply_action(self, joint_pos_target: np.ndarray):
@@ -267,10 +463,29 @@ class FingerPushEnv(gym.Env):
         self.data.ctrl[:self.num_dof] = torque.astype(np.float32)
 
     def _check_goal_progress(self):
+        """
+        Count sim-step holds only when distance, (optional) no-roll, and low velocity are satisfied.
+        """
         adr_q = int(self.jnt_qposadr[self.cube_free_jid])
-        cube_pos = self.data.qpos[adr_q + 4:adr_q + 7]
-        cube_xy = cube_pos[:2]
-        if np.linalg.norm(cube_xy - self.target_pos_xy) < 0.05:
+        adr_v = int(self.jnt_dofadr[self.cube_free_jid])
+        qpos = self.data.qpos[adr_q:adr_q + 7]
+        qvel = self.data.qvel[adr_v:adr_v + 6]
+
+        cube_xy = qpos[0:2]
+        cube_quat = qpos[3:7]
+        cube_linvel = qvel[0:3]
+        cube_angvel = qvel[3:6]
+
+        dist_ok = (np.linalg.norm(cube_xy - self.target_pos_xy) < self.success_radius)
+        vel_ok = (np.linalg.norm(cube_linvel[:2]) <= float(self.vel_success_tol))
+
+        noroll_ok = True
+        if self.no_roll:
+            angle_rad = self._quat_angle(self.init_quat, cube_quat)
+            ang_ok = (np.linalg.norm(cube_angvel) <= float(self.angvel_success_tol))
+            noroll_ok = (angle_rad < np.deg2rad(self.no_roll_max_deg)) and ang_ok
+
+        if dist_ok and vel_ok and noroll_ok:
             self.reach_goal_timer += 1
         else:
             self.reach_goal_timer = 0
@@ -280,23 +495,87 @@ class FingerPushEnv(gym.Env):
         self.reach_goal_timer = 0
         self.current_step = 0
         self.prev_action = np.zeros(self.num_dof, dtype=np.float32)
-        # Randomize initial cube and robot positions for generalization
+        self.goal_hold_agent_steps = 0
+
         adr_q = int(self.jnt_qposadr[self.cube_free_jid])
+        adr_v = int(self.jnt_dofadr[self.cube_free_jid])
+
         mujoco.mj_resetData(self.model, self.data)
-        # Randomize cube position (xy)
-        cube_init_xy = self.cube_init_pos + np.random.uniform(-0.10, 0.10, size=2).astype(np.float32)  # ±10cm variation
-        self.data.qpos[adr_q + 4:adr_q + 6] = cube_init_xy
-        # Randomize robot joint positions within limits
+
+        # Curriculum-aware reset randomization
+        jitter = float(getattr(self, "init_xy_jitter", 0.10))
+        cube_init_xy = self.cube_init_pos + np.random.uniform(-jitter, +jitter, size=2).astype(np.float32)
+        self.data.qpos[adr_q + 0:adr_q + 2] = cube_init_xy
+
+        # Log fingertip proximity at reset (helps diagnose reachability)
+        try:
+            fingertip_site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "finger_tip")
+            if fingertip_site_id != -1:
+                fingertip_xy = self.data.site_xpos[fingertip_site_id][:2].copy()
+                reset_dist = float(np.linalg.norm(fingertip_xy - cube_init_xy))
+                if self.writer is not None:
+                    self.writer.add_scalar("reset/fingertip_to_cube", reset_dist, self.episode_counter)
+        except Exception:
+            pass
+
+        # Save initial orientation for no-roll metric
+        free_qpos = self.data.qpos[adr_q:adr_q + 7]
+        self.init_quat = free_qpos[3:7].copy().astype(np.float32)
+
+        # --- Curriculum schedule: linearly anneal offset & success radius over episodes ---
+        # Compute progress fraction for auto curriculum
+        if self.auto_curriculum:
+            if self.curriculum_mode == "performance":
+                frac = float(self.curriculum_progress)
+            else:
+                frac = min(1.0, float(self.episode_counter) / max(1, int(self.curriculum_episodes)))
+        else:
+            frac = 1.0 if not self.curriculum else 0.0
+        # If EASY_CURRICULUM=1, start easier (frac near 0 early); otherwise still anneal if AUTO_CURRICULUM=1
+        start_off = self.easy_target_offset if (self.curriculum or self.auto_curriculum) else self.hard_target_offset
+        end_off = self.hard_target_offset
+        self.target_offset = (1.0 - frac) * start_off + frac * end_off
+
+        start_sr = self.easy_success_radius if (self.curriculum or self.auto_curriculum) else self.hard_success_radius
+        end_sr = self.hard_success_radius
+        self.success_radius = float((1.0 - frac) * start_sr + frac * end_sr)
+        # Allow explicit SUCCESS_RADIUS override to win
+        if "SUCCESS_RADIUS" in os.environ:
+            try:
+                self.success_radius = float(os.environ["SUCCESS_RADIUS"])  # explicit override
+            except Exception:
+                pass
+
+        # Set target forward of the current cube start with the scheduled offset
+        self.target_pos_xy = cube_init_xy + float(self.target_offset) * self.forward_axis
+
+        # Initialize robot joints near the nominal pose (small noise), curriculum gentler
+        span = (self.joint_upper - self.joint_lower).astype(np.float32)
+        noise_scale = 0.02 if self.curriculum else 0.05  # fraction of span
         for i, jid in enumerate(self.actuated_joint_ids):
-            low, high = self.joint_lower[i], self.joint_upper[i]
-            self.data.qpos[int(self.jnt_qposadr[jid])] = float(np.random.uniform(low, high))
-        # Set prev_dist for progress reward
-        self.prev_dist = float(np.linalg.norm(self.data.qpos[adr_q + 4:adr_q + 6] - self.target_pos_xy))
+            qadr = int(self.jnt_qposadr[jid])
+            jitter = float(np.random.uniform(-noise_scale, noise_scale)) * float(span[i])
+            self.data.qpos[qadr] = float(np.clip(self.default_joint_pos[i] + jitter,
+                                                 self.joint_lower[i], self.joint_upper[i]))
+
+        # Track distance/projection for shaping
+        self.prev_dist = float(np.linalg.norm(self.data.qpos[adr_q + 0:adr_q + 2] - self.target_pos_xy))
+        self.prev_proj = float(np.dot((self.target_pos_xy - self.data.qpos[adr_q + 0:adr_q + 2]), self.forward_axis))
+
+        # Move visual target marker if it exists
         try:
             marker_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "target_marker")
             self.model.geom_pos[marker_id] = np.array([self.target_pos_xy[0], self.target_pos_xy[1], 0.05], dtype=np.float32)
         except Exception:
             pass
+
+        if self.writer is not None:
+            try:
+                self.writer.add_scalar("curriculum/progress", float(self.curriculum_progress), self.episode_counter)
+                self.writer.add_scalar("curriculum/success_radius", float(self.success_radius), self.episode_counter)
+                self.writer.add_scalar("curriculum/target_offset", float(self.target_offset), self.episode_counter)
+            except Exception:
+                pass
         return self._get_obs(), {}
 
     def render(self):
