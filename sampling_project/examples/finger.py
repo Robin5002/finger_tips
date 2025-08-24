@@ -73,8 +73,8 @@ def main(gui=True, num_steps=20):
         num_samples=num_samples,          # number of sampled trajectories
         temperature=1.0,                  # temperature parameter for weighting
         noise_level=0.3,                  # exploration noise std
-        #u_min=-1.0,                      # control lower bound
-        #u_max=1.0,                       # control upper bound
+        # u_min=-1.0,                      # control lower bound
+        # u_max=1.0,                       # control upper bound
         seed=0,
     )
 

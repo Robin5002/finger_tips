@@ -35,7 +35,7 @@ class Finger(Task):
         cube_xy = cube_pos[:2]
 
         dist_cost = jnp.sum((cube_xy - self.target_xy) ** 2)
-        control_cost = 0.5 * jnp.sum(control ** 2)
+        control_cost = 1.0 * jnp.sum(control ** 2)
 
         return dist_cost + control_cost
 
@@ -48,4 +48,4 @@ class Finger(Task):
         cube_pos = state.qpos[-3:]
         cube_xy = cube_pos[:2]
 
-        return 100.0 * jnp.sum((cube_xy - self.target_xy) ** 2)
+        return 50.0 * jnp.sum((cube_xy - self.target_xy) ** 2)
