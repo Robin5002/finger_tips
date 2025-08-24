@@ -22,6 +22,8 @@ dependencies = [
     "jax[cuda12-local]>=0.4.35",
     "mujoco>=3.2.4",
     "mujoco-mjx>=3.2.4",
+    "tqdm>=4.66.0",
+    "imageio>=2.34.0",
 ]
 
 [project.optional-dependencies]

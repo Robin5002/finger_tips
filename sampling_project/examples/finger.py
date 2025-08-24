@@ -5,6 +5,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import jax
 import jax.numpy as jnp
+from tqdm import trange  # Add tqdm import for progress bar
+import imageio.v2 as imageio  # Add this import at the top
+import time
 
 from hydrax.algs import MPPI
 from hydrax.simulation.deterministic import run_interactive
@@ -47,6 +50,8 @@ with logging & plotting of rollout costs.
 
 def main(gui=True, num_steps=20):
     # Define the task (includes sensors and costs)
+        
+    start_time = time.time()
     task = Finger()
 
     # ------------------ Set up MPPI Controller ------------------ #
@@ -54,7 +59,7 @@ def main(gui=True, num_steps=20):
     if device_type == "gpu":
         # Use moderate parameters for GPU acceleration
         plan_horizon = 8
-        num_samples = 50
+        num_samples = 64
         print("✓ Using GPU-optimized parameters for faster training")
     else:
         # Use lower parameters for CPU to maintain reasonable speed
@@ -71,15 +76,11 @@ def main(gui=True, num_steps=20):
         #u_min=-1.0,                      # control lower bound
         #u_max=1.0,                       # control upper bound
         seed=0,
-    )sampling_project$ ps aux | grep python
-root        1568  0.0  0.1 118328 24704 ?        Ssl  14:06   0:00 /usr/bin/python3 /usr/share/unattended-upgrades/unattended-upgrade-shutdown --wait-for-signal
-robin      11743  0.0  0.0   6080  4792 ?        S    15:37   0:02 /home/robin/.vscode/extensions/ms-python.vscode-python-envs-1.2.0-linux-x64/python-env-tools/bin/pet server
-robin      12272  1.3  4.6 1223010872 748536 ?   Sl   15:37   0:54 /usr/share/code/code /home/robin/.vscode/extensions/ms-python.vscode-pylance-2025.6.2/dist/server.bundle.js --cancellationReceive=file:d63161ac7bf759904f440090fb9eef7b1919baafc0 --node-ipc --clientProcessId=11508
-robin      17081  0.0  0.0   9636  2432 pts/3    S+   16:43   0:00 grep --color=auto python
+    )
 
     # Define the model used for simulation
     mj_model = task.mj_model
-    mj_model.opt.timestep = 0.001
+    mj_model.opt.timestep = 0.01
     mj_model.opt.iterations = 100
     mj_model.opt.ls_iterations = 50
 
@@ -96,8 +97,13 @@ robin      17081  0.0  0.0   9636  2432 pts/3    S+   16:43   0:00 grep --color=
     # Initialize controller policy parameters
     policy_params = ctrl.init_params()
 
+    # ------------------ Video Setup ------------------ #
+    video_frames = []
+    width, height = 640, 480
+    renderer = mujoco.Renderer(mj_model, width=width, height=height)
+
     # Custom rollout loop with logging
-    for step in range(num_steps):
+    for step in trange(num_steps, desc="Simulating", unit="step"):
         # Convert to JAX state first
         state = mjx.put_data(mj_model, mj_data)
 
@@ -118,11 +124,20 @@ robin      17081  0.0  0.0   9636  2432 pts/3    S+   16:43   0:00 grep --color=
         terminal_costs.append(float(tc))
         rollout_costs.append(float(total))
 
+        # Render and save frame for video
+        renderer.update_scene(mj_data)
+        frame = renderer.render()
+        video_frames.append(frame)
+
         if gui:
             mujoco.mj_forward(mj_model, mj_data)
 
     # ------------------ Plot Results ------------------ #
     plt.figure(figsize=(10, 6))
+    end_time = time.time()
+    total_time = end_time - start_time
+    print(f"Total simulation time: {total_time:.2f} seconds")
+    print(f"Average time per step: {total_time/num_steps:.2f} seconds")
     plt.plot(running_costs, label="Running Cost")
     plt.plot(terminal_costs, label="Terminal Cost")
     plt.plot(rollout_costs, label="Total Cost")
@@ -131,7 +146,15 @@ robin      17081  0.0  0.0   9636  2432 pts/3    S+   16:43   0:00 grep --color=
     plt.title("MPPI Rollout Cost Breakdown")
     plt.legend()
     plt.grid(True)
-    plt.show()
+    plt.savefig("rollout_costs.png")
+
+    # ------------------ Save Video ------------------ #
+    video_path = "finger_simulation.mp4"
+    imageio.mimsave(video_path, video_frames, fps=int(1/24))
+    print(f"Video saved to {video_path}")
+
+    # Save the trained policy parameters to a file
+    np.save("finger_policy_params.npy", np.array(policy_params))
 
 
 if __name__ == "__main__":
