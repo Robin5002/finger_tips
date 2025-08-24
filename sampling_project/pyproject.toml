@@ -1,5 +1,7 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = [
+    "setuptools>=61.0",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,71 +9,83 @@ name = "hydrax"
 version = "0.0.2"
 description = "Sampling-based model predictive control on GPU with JAX/MJX"
 readme = "README.md"
-license = {text="MIT"}
 requires-python = ">=3.12.0"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Programming Language :: Python",
 ]
-# TODO: evosax v0.2.0 introduced many breaking changes in the API that cause test failures
 dependencies = [
-    "evosax<0.2.0",
-    "flax>=0.10.0",
-    "huggingface_hub>=0.29.3",
-    "interpax>=0.3.7",
-    "jax[cuda12-local]>=0.4.35",
-    "mujoco>=3.2.4",
-    "mujoco-mjx>=3.2.4",
-    "tqdm>=4.66.0",
-    "imageio>=2.34.0",
+    "evosax>=0.1.6",
+    "flax>=0.11.1",
+    "huggingface_hub>=0.34.4",
+    "interpax>=0.3.10",
+    "jax[cuda12-local]>=0.7.1",
+    "mujoco>=3.3.5",
+    "mujoco-mjx>=3.3.5",
+    "tqdm>=4.67.1",
+    "imageio>=2.37.0",
+    "numpy>=2.3.2",
+    "pandas>=2.3.2",
+    "seaborn>=0.13.2",
+    "matplotlib>=3.10.5",
 ]
+
+[project.license]
+text = "MIT"
 
 [project.optional-dependencies]
 dev = [
-    "matplotlib>=3.9.2",
+    "matplotlib>=3.10.5",
     "pre-commit>=4.0.1",
     "pytest>=8.3.3",
     "ruff>=0.7.1",
+]
+cpu = [
+    "jax>=0.7.1",
 ]
 
 [tool.ruff]
 line-length = 80
 
 [tool.ruff.lint]
-pydocstyle.convention = "google"
 select = [
-    "ANN",  # annotations
-    "N",  # naming conventions
-    "D",  # docstrings
-    "B",  # flake8 bugbear
-    "E",  # pycodestyle errors
-    "F",  # Pyflakes rules
-    "I",  # isort formatting
-    "PLC",  # Pylint convention warnings
-    "PLE",  # Pylint errors
-    "PLR",  # Pylint refactor recommendations
-    "PLW",  # Pylint warnings
+    "ANN",
+    "N",
+    "D",
+    "B",
+    "E",
+    "F",
+    "I",
+    "PLC",
+    "PLE",
+    "PLR",
+    "PLW",
 ]
 ignore = [
-    "ANN003",  # missing type annotation for **kwargs
-    "ANN202",  # missing return type annotation for private function
-    "ANN204",  # missing return type annotation for `__init__`
-    "ANN401",  # dynamically typed expressions (typing.Any) are disallowed
-    "D100",  # missing docstring in public module
-    "D104",  # missing docstring in public package
-    "D203",  # blank line before class docstring
-    "D211",  # no blank line before class
-    "D212",  # multi-line docstring summary at first line
-    "D213",  # multi-line docstring summary at second line
-    "E731",  # assigning to a `lambda` expression
-    "N806",  # only lowercase variables in functions
-    "PLR0913",  # too many arguments
-    "PLR2004",  # magic value used in comparison
+    "ANN003",
+    "ANN202",
+    "ANN204",
+    "ANN401",
+    "D100",
+    "D104",
+    "D203",
+    "D211",
+    "D212",
+    "D213",
+    "E731",
+    "N806",
+    "PLR0913",
+    "PLR2004",
 ]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
 
 [tool.ruff.lint.isort]
 combine-as-imports = true
-known-first-party = ["hydrax"]
+known-first-party = [
+    "hydrax",
+]
 split-on-trailing-comma = false
 
 [tool.ruff.format]
@@ -88,4 +102,6 @@ testpaths = [
 ]
 
 [tool.setuptools]
-packages = ["hydrax"]
+packages = [
+    "hydrax",
+]
