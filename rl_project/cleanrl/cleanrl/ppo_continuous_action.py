@@ -381,6 +381,7 @@ def train(args):
     ep_len_acc = 0
     ep_last_dist = float('nan')
     ep_last_succ = 0.0
+    ep_succ_ever = 0.0  # Tracks if any step in the episode was ever successful (success_ever)
 
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
@@ -477,23 +478,24 @@ def train(args):
             d_now = _get_info_scalar(infos, "dist_to_target")
             if d_now is not None:
                 ep_last_dist = float(d_now)
-            s_now = _get_info_scalar(infos, "success_held")
+            s_now = _get_info_scalar(infos, "success_ever")
+            if s_now is None:
+                s_now = _get_info_scalar(infos, "success_held")
             if s_now is None:
                 s_now = _get_info_scalar(infos, "success")
             if s_now is not None:
                 ep_last_succ = float(s_now)
+                if s_now >= 0.5:
+                    ep_succ_ever = 1.0
             # ---- accumulate quick diagnostics from infos ----
             try:
                 d_now = _get_info_scalar(infos, "dist_to_target")
                 if d_now is not None:
                     iter_min_dist = min(iter_min_dist, d_now)
-            except Exception:
-                pass
-            try:
-                s_now = _get_info_scalar(infos, "success_held")
-                if s_now is None:
-                    s_now = _get_info_scalar(infos, "success")
-                if s_now is not None and s_now >= 0.5:
+                
+                # Per user request: count success_flag (in radius), not held success
+                s_flag = _get_info_scalar(infos, "success_flag")
+                if s_flag is not None and s_flag >= 0.5:
                     iter_success_hits += 1
             except Exception:
                 pass
@@ -548,12 +550,13 @@ def train(args):
                 ep_hist.append({
                     "ret": ep_ret_acc,
                     "len": ep_len_acc,
-                    "succ": 1.0 if ep_last_succ >= 0.5 else 0.0,
+                    "succ": ep_succ_ever,
                     "dist": ep_last_dist,
                 })
                 # reset accumulators
                 ep_ret_acc, ep_len_acc = 0.0, 0
                 ep_last_dist, ep_last_succ = float('nan'), 0.0
+                ep_succ_ever = 0.0
 
             if "final_info" in infos:
                 for info in infos["final_info"]:
@@ -565,10 +568,12 @@ def train(args):
                         # Reset fallback accumulators when proper final_info is available
                         ep_ret_acc, ep_len_acc = 0.0, 0
                         ep_last_dist, ep_last_succ = float('nan'), 0.0
+                        ep_succ_ever = 0.0
 
                         # Terminal diagnostics
-                        succ = (info.get("success_held") if isinstance(info, dict) and ("success_held" in info)
-                                else (info.get("success") if isinstance(info, dict) else None))
+                        succ = (info.get("success_ever") if isinstance(info, dict) and ("success_ever" in info)
+                              else (info.get("success_held") if isinstance(info, dict) and ("success_held" in info)
+                                  else (info.get("success") if isinstance(info, dict) else None)))
                         dist = info.get("dist_to_target") if isinstance(info, dict) else None
                         extra = []
                         if succ is not None:
@@ -599,7 +604,7 @@ def train(args):
                                 print(f"    ↳ reward_snapshot: {snap}")
 
                         # Log success/dist/orientation if provided by the env
-                        succ_for_log = (info.get("success_held") if "success_held" in info else info.get("success") if "success" in info else None)
+                        succ_for_log = (info.get("success_ever") if "success_ever" in info else info.get("success_held") if "success_held" in info else info.get("success") if "success" in info else None)
                         if succ_for_log is not None:
                             writer.add_scalar("episode/success", 1.0 if succ_for_log else 0.0, global_step)
                             if args.track:
@@ -624,7 +629,17 @@ def train(args):
                         except Exception:
                             ep_ret, ep_len = float("nan"), float("nan")
                         succ_f = None
-                        if "success" in info:
+                        if "success_ever" in info:
+                            try:
+                                succ_f = bool(info["success_ever"]) * 1.0
+                            except Exception:
+                                succ_f = None
+                        elif "success_held" in info:
+                            try:
+                                succ_f = bool(info["success_held"]) * 1.0
+                            except Exception:
+                                succ_f = None
+                        elif "success" in info:
                             try:
                                 succ_f = bool(info["success"]) * 1.0
                             except Exception:
@@ -761,7 +776,7 @@ def train(args):
             def _safe_mean(k):
                 vals = [x[k] for x in last_n if x.get(k) is not None and not (isinstance(x.get(k), float) and np.isnan(x.get(k)))]
                 return float(np.mean(vals)) if len(vals) > 0 else float("nan")
-            sr = _safe_mean("succ")  # success rate (0/1)
+            sr = _safe_mean("succ")  # success rate (0/1, now using ever-success)
             mr = _safe_mean("ret")   # mean episodic return
             md = _safe_mean("dist")  # mean terminal distance
             ml = _safe_mean("len")   # mean episode length

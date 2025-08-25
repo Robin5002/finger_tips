@@ -140,6 +140,9 @@ class FingerPushEnv(gym.Env):
         # Last termination cause string for logging in infos (no printing by default)
         self._last_done_cause = None  # one of {"success","time_limit","oob", None}
 
+        # Track whether success_held was ever achieved within the current episode
+        self.success_ever = False
+
         # ---------- Controller parameters ----------
         self.kp = 2.0   # Position gain (prof spec)
         self.kd = 0.1   # Velocity gain (prof spec)
@@ -162,6 +165,21 @@ class FingerPushEnv(gym.Env):
         self.success_bonus = float(os.getenv("SUCCESS_BONUS", "150.0" if not self.curriculum else "80.0"))
         self.stay_near_bonus = float(os.getenv("STAY_NEAR_BONUS", "3.0" if not self.curriculum else "1.5"))
         self.time_penalty_coef = float(os.getenv("TIME_PENALTY_COEF", "0.005" if not self.curriculum else "0.01"))
+
+        # New: Allow environment variable overrides for penalty coefficients
+        self.no_roll_penalty_coef = float(os.getenv("NO_ROLL_PENALTY_COEF", "5.0"))
+        self.angvel_penalty_coef = float(os.getenv("ANGVEL_PENALTY_COEF", "0.05"))
+        self.action_penalty_coef = float(os.getenv("ACTION_PENALTY_COEF", "0.01"))
+
+        # Restoring torque gains for no-roll mode (applied to cube rotational DOFs)
+        # Stronger defaults to resist visible rolling; tune these if translation is impacted
+        # Bumped to high values to firmly resist roll; reduce if translation is impaired
+    # Safer default gains to avoid instabilities; tune via env vars if needed
+    self.no_roll_torque_kp = float(os.getenv("NO_ROLL_TORQUE_KP", "40.0"))
+    self.no_roll_torque_kd = float(os.getenv("NO_ROLL_TORQUE_KD", "4.0"))
+    self.no_roll_max_torque = float(os.getenv("NO_ROLL_MAX_TORQUE", "200.0"))
+    # Additional global scale (multiply raw gains) to quickly dampen torque magnitude
+    self.no_roll_torque_scale = float(os.getenv("NO_ROLL_TORQUE_SCALE", "0.02"))
 
         # ---------- Episode settings ----------
         # Longer horizon in hard mode helps complete 0.20 m pushes; override via EPISODE_SECONDS
@@ -204,6 +222,53 @@ class FingerPushEnv(gym.Env):
         for _ in range(self.decimation):
             self._apply_action(processed_action)
             mujoco.mj_step(self.model, self.data)
+            # If no_roll mode is enabled, force the cube to keep its initial orientation
+            # and zero its angular velocity so it can translate (be kicked) without rolling.
+            # This is a minimal, deterministic enforcement that preserves linear motion.
+            if self.no_roll and hasattr(self, 'init_quat'):
+                try:
+                    adr_q = int(self.jnt_qposadr[self.cube_free_jid])
+                    adr_v = int(self.jnt_dofadr[self.cube_free_jid])
+                    # Read current orientation and angular velocity
+                    q_cur = self.data.qpos[adr_q + 3: adr_q + 7].astype(np.float32)
+                    ang_vel = self.data.qvel[adr_v + 3: adr_v + 6].astype(np.float32)
+
+                    # Quaternion error: q_err = q_cur * conj(q_init)
+                    q_init = self.init_quat
+                    # conj of q_init
+                    q_init_conj = np.array([q_init[0], -q_init[1], -q_init[2], -q_init[3]], dtype=np.float32)
+                    a0, a1, a2, a3 = q_cur[0], q_cur[1], q_cur[2], q_cur[3]
+                    b0, b1, b2, b3 = q_init_conj[0], q_init_conj[1], q_init_conj[2], q_init_conj[3]
+                    # quaternion multiply a * b
+                    q_err = np.empty(4, dtype=np.float32)
+                    q_err[0] = a0 * b0 - a1 * b1 - a2 * b2 - a3 * b3
+                    q_err[1] = a0 * b1 + a1 * b0 + a2 * b3 - a3 * b2
+                    q_err[2] = a0 * b2 - a1 * b3 + a2 * b0 + a3 * b1
+                    q_err[3] = a0 * b3 + a1 * b2 - a2 * b1 + a3 * b0
+
+                    # Use vector part of q_err as small-angle proportional error measure
+                    q_err_vec = q_err[1:4]
+
+                    # PD torque: proportional on quaternion vector part, derivative on ang vel
+                    kp = float(getattr(self, 'no_roll_torque_kp', 20.0))
+                    kd = float(getattr(self, 'no_roll_torque_kd', 2.0))
+                    max_t = float(getattr(self, 'no_roll_max_torque', 100.0))
+                    torque = (-kp * q_err_vec) - (kd * ang_vel)
+                    # clip
+                    torque = np.clip(torque, -max_t, max_t).astype(np.float32)
+
+                    # Apply torques to rotational generalized forces (wx,wy,wz) for the free joint
+                    try:
+                        self.data.qfrc_applied[adr_v + 3: adr_v + 6] += torque
+                    except Exception:
+                        # If qfrc_applied isn't available, fallback to body forces (best-effort)
+                        try:
+                            # Apply equal and opposite body torques via xfrc_applied placeholder
+                            self.data.xfrc_applied[adr_q + 0: adr_q + 3] += 0.0
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             self._check_goal_progress()
             if self.render_mode == "human" and self.viewer is not None:
                 self.render()
@@ -238,6 +303,9 @@ class FingerPushEnv(gym.Env):
         # Unified held flag
         success_held = bool(success_held_agent or success_held_sim)
 
+        if success_held:
+            self.success_ever = True
+
         # Prepare observation and reward
         next_obs = self._get_obs()
         reward_dict = self._get_reward()
@@ -263,10 +331,21 @@ class FingerPushEnv(gym.Env):
             "success_held": bool(success_held),
             "dist_to_target": dist_to_target,
             "hold_steps": int(self.goal_hold_agent_steps),
+            # expose radius & instantaneous speeds for diagnosing SR=0 issues
+            "success_radius": float(self.success_radius),
+            "lin_speed": float(np.linalg.norm(cube_linvel[:2])),
+            "ang_speed": float(np.linalg.norm(cube_angvel)),
+            "success_ever": bool(self.success_ever),
         }
         if self.no_roll:
             info_dict["orientation_deg"] = orientation_deg
-            # also expose whether sim-step criterion is active
+            # boolean gating at the agent boundary for quick triage
+            info_dict["vel_ok"] = bool(np.linalg.norm(cube_linvel[:2]) <= float(self.vel_success_tol))
+            info_dict["ang_ok"] = bool(
+                (orientation_deg < float(self.no_roll_max_deg)) and
+                (np.linalg.norm(cube_angvel) <= float(self.angvel_success_tol))
+            )
+        # also expose whether sim-step criterion is active
         info_dict["sim_held"] = bool(success_held_sim)
 
         # Attach done_cause if episode ended
@@ -376,6 +455,7 @@ class FingerPushEnv(gym.Env):
 
         # 4) Contact encouragement (robust to missing site)
         contact_reward = 0.0
+        center_bonus = 0.0
         try:
             fingertip_site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "finger_tip")
             if fingertip_site_id != -1:
@@ -385,9 +465,22 @@ class FingerPushEnv(gym.Env):
                     contact_reward = 5.0
                 elif fingertip_to_cube < 0.05:
                     contact_reward = 2.0
+                # Center-hit bonus: encourage contact near cube face center (small lateral offset)
+                # Project fingertip->cube onto lateral axis (y if forward_axis is +x)
+                try:
+                    lateral_offset = abs((fingertip_pos - cube_xy)[1])
+                    # bonus decreases linearly up to 4 cm lateral offset
+                    if fingertip_to_cube < 0.05 and lateral_offset < 0.04:
+                        center_bonus = 6.0 * (0.04 - lateral_offset)  # stronger incentive
+                    else:
+                        center_bonus = 0.0
+                except Exception:
+                    center_bonus = 0.0
         except Exception:
+            center_bonus = 0.0
             pass
         rewards["contact"] = contact_reward
+        rewards["center_hit"] = float(center_bonus)
 
         # 5) Success bonus (use unified success radius)
         rewards["success"] = self.success_bonus if dist_to_target < self.success_radius else 0.0
@@ -395,14 +488,14 @@ class FingerPushEnv(gym.Env):
         rewards["stay_near"] = self.stay_near_bonus if dist_to_target < self.success_radius else 0.0
 
         # 6) Efficiency
-        rewards["action_penalty"] = -0.01 * np.sum(np.square(self.prev_action))
+        rewards["action_penalty"] = -self.action_penalty_coef * np.sum(np.square(self.prev_action))
         rewards["time_penalty"] = -float(self.time_penalty_coef)
 
         # 7) No-roll shaping if enabled
         if self.no_roll:
             angle = self._quat_angle(self.init_quat, cube_quat)  # radians
-            rewards["no_roll_penalty"] = -5.0 * (angle ** 2)
-            rewards["angvel_penalty"] = -0.05 * float(np.dot(cube_angvel, cube_angvel))
+            rewards["no_roll_penalty"] = -self.no_roll_penalty_coef * (angle ** 2)
+            rewards["angvel_penalty"] = -self.angvel_penalty_coef * float(np.dot(cube_angvel, cube_angvel))
 
         # 8) Euclidean progress (non-negative)
         if hasattr(self, 'prev_dist'):
@@ -496,6 +589,7 @@ class FingerPushEnv(gym.Env):
         self.current_step = 0
         self.prev_action = np.zeros(self.num_dof, dtype=np.float32)
         self.goal_hold_agent_steps = 0
+        self.success_ever = False
 
         adr_q = int(self.jnt_qposadr[self.cube_free_jid])
         adr_v = int(self.jnt_dofadr[self.cube_free_jid])
@@ -518,9 +612,13 @@ class FingerPushEnv(gym.Env):
         except Exception:
             pass
 
-        # Save initial orientation for no-roll metric
+        # Save and normalize initial orientation for no-roll metric
         free_qpos = self.data.qpos[adr_q:adr_q + 7]
-        self.init_quat = free_qpos[3:7].copy().astype(np.float32)
+        q = free_qpos[3:7].astype(np.float32).copy()
+        q_norm = np.linalg.norm(q)
+        if q_norm > 0:
+            q = q / q_norm
+        self.init_quat = q
 
         # --- Curriculum schedule: linearly anneal offset & success radius over episodes ---
         # Compute progress fraction for auto curriculum
@@ -545,6 +643,14 @@ class FingerPushEnv(gym.Env):
                 self.success_radius = float(os.environ["SUCCESS_RADIUS"])  # explicit override
             except Exception:
                 pass
+
+        # Clamp to a reasonable minimum to avoid accidental zero/tiny radius (e.g., bad env var)
+        try:
+            min_sr = float(os.getenv("SUCCESS_RADIUS_MIN", "0.03"))  # 3 cm default floor
+            if self.success_radius < min_sr:
+                self.success_radius = float(min_sr)
+        except Exception:
+            pass
 
         # Set target forward of the current cube start with the scheduled offset
         self.target_pos_xy = cube_init_xy + float(self.target_offset) * self.forward_axis

@@ -74,7 +74,7 @@ if __name__ == "__main__":
     args = Args(
         env_id="FingerPush-v0",           # Part (a)
         exp_name="finger_push_ppo",
-        total_timesteps=500_000,           # recommended for convergence
+        total_timesteps=int(os.getenv("TOTAL_TIMESTEPS", "500000")), # Allow override for grid search; default 500k
         num_envs=1,
         track=True,                        # W&B ON
         wandb_project_name="mujoco_tutorial",
@@ -84,112 +84,48 @@ if __name__ == "__main__":
         cuda=False,                        # force CPU; faster for MuJoCo on Apple Silicon
     )
 
-    # Allow environment override via ENV_ID or NO_ROLL=1
-    env_id_override = os.environ.get("ENV_ID")
-    if os.environ.get("NO_ROLL", "0") == "1":
-        env_id_override = "FingerPushNoRoll-v0"
-    if env_id_override:
-        print(f"🔁 Overriding env_id → {env_id_override}")
-        args.env_id = env_id_override
+    # --- Apply recovered run hyperparameters as defaults, but allow environment overrides ---
+    # Recovered best-run defaults:
+    # learning_rate=0.0003, clip_coef=0.2, ent_coef=0, num_steps=2048,
+    # num_minibatches=32, update_epochs=10, total_timesteps=200000
+    args.learning_rate = float(os.getenv("LEARNING_RATE", str(getattr(args, 'learning_rate', 0.0003))))
+    args.clip_coef = float(os.getenv("CLIP_COEF", str(getattr(args, 'clip_coef', 0.2))))
+    args.ent_coef = float(os.getenv("ENT_COEF", str(getattr(args, 'ent_coef', 0.0))))
+    args.num_steps = int(os.getenv("NUM_STEPS", str(getattr(args, 'num_steps', 2048))))
+    args.num_minibatches = int(os.getenv("NUM_MINIBATCHES", str(getattr(args, 'num_minibatches', 32))))
+    args.update_epochs = int(os.getenv("UPDATE_EPOCHS", str(getattr(args, 'update_epochs', 10))))
+    args.total_timesteps = int(os.getenv("TOTAL_TIMESTEPS", str(getattr(args, 'total_timesteps', 500000))))
 
-    # Recommended PPO knobs for this task
-    args.learning_rate = 3e-4
-    args.num_steps = 1024
-    args.num_minibatches = 32
-    args.update_epochs = 10
-    args.ent_coef = 0.01
-    args.clip_coef = 0.2
-    args.target_kl = 0.015
 
-    if EASY_CURRICULUM:
-        # Softer updates + more exploration
-        args.clip_coef = 0.10
-        args.ent_coef = 0.02
-        # More frequent updates
-        args.num_steps = 512
-        # Slightly stricter KL target
-        args.target_kl = 0.012
-
-    # --- Optional overrides via environment variables ---
-    def _envf(name, default=None):
-        v = os.environ.get(name)
-        if v is None:
-            return default
-        try:
-            return float(v)
-        except Exception:
-            return default
-    def _envi(name, default=None):
-        v = os.environ.get(name)
-        if v is None:
-            return default
-        try:
-            return int(v)
-        except Exception:
-            return default
-
-    lr = _envf("LEARNING_RATE", None)
-    if lr is not None:
-        args.learning_rate = lr
-        print(f"🔧 Override: learning_rate = {args.learning_rate}")
-    ns = _envi("NUM_STEPS", None)
-    if ns is not None:
-        args.num_steps = ns
-        print(f"🔧 Override: num_steps = {args.num_steps}")
-    nmb = _envi("NUM_MINIBATCHES", None)
-    if nmb is not None:
-        args.num_minibatches = nmb
-        print(f"🔧 Override: num_minibatches = {args.num_minibatches}")
-    ue = _envi("UPDATE_EPOCHS", None)
-    if ue is not None:
-        args.update_epochs = ue
-        print(f"🔧 Override: update_epochs = {args.update_epochs}")
-    ec = _envf("ENT_COEF", None)
-    if ec is not None:
-        args.ent_coef = ec
-        print(f"🔧 Override: ent_coef = {args.ent_coef}")
-    cc = _envf("CLIP_COEF", None)
-    if cc is not None:
-        args.clip_coef = cc
-        print(f"🔧 Override: clip_coef = {args.clip_coef}")
-    tkl = _envf("TARGET_KL", None)
-    if tkl is not None:
-        args.target_kl = tkl
-        print(f"🔧 Override: target_kl = {args.target_kl}")
-    
-    # Optional: allow overriding via best_params.json only when explicitly enabled
-    use_best = os.environ.get("USE_BEST_PARAMS", "0") == "1"
-    if use_best and best_params:
-        print("✅ Applying overrides from best_params.json (USE_BEST_PARAMS=1)")
-        for key, value in best_params.items():
-            if hasattr(args, key):
-                setattr(args, key, value)
-                print(f"🔧 Overrode {key} = {value}")
-            else:
-                print(f"⚠️ Unknown parameter in best_params: {key}")
-    else:
-        print("ℹ️ Skipping best_params.json overrides (set USE_BEST_PARAMS=1 to enable).")
-    
-    print(f"\n🚀 FAST CPU TRAINING WITH WANDB:")
-    print(f"   📦 Task: Finger pushing task")
-    print(f"   🎯 Target: {args.total_timesteps:,} timesteps")
-    print(f"   ⚙️  Hyperparameters: {'Optimized' if best_params else 'Default'}")
-    print(f"   📊 WandB tracking: {'Enabled' if args.track else 'Disabled'}")
-    print(f"   📹 Video capture: {'Enabled' if args.capture_video else 'Disabled'}")
-    print(f"   🔧 Device: {'CUDA' if args.cuda and torch.cuda.is_available() else 'CPU (Optimized for MuJoCo)'}")
-    print(f"   🎚️ Curriculum: {'ON (easy)' if EASY_CURRICULUM else 'OFF'}")
-    print(f"   🧪 Env ID: {args.env_id}")
+    # ASCII-safe banner to avoid UnicodeEncodeError in some terminals/Python builds
+    print("\nFAST CPU TRAINING WITH WANDB:")
+    print("   Task: Finger pushing task")
+    print(f"   Target: {args.total_timesteps:,} timesteps")
+    print(f"   Hyperparameters: {'Optimized' if best_params else 'Default'}")
+    print(f"   WandB tracking: {'Enabled' if args.track else 'Disabled'}")
+    print(f"   Video capture: {'Enabled' if args.capture_video else 'Disabled'}")
+    print(f"   Device: {'CUDA' if args.cuda and torch.cuda.is_available() else 'CPU (Optimized for MuJoCo)'}")
+    print(f"   Curriculum: {'ON (easy)' if EASY_CURRICULUM else 'OFF'}")
+    print(f"   Env ID: {args.env_id}")
     print()
     # Display key env knobs (if set) so runs are reproducible from the log
     for k in [
-        "SUCCESS_BONUS","STAY_NEAR_BONUS","TIME_PENALTY_COEF","SUCCESS_HOLD_SIMSTEPS",
-        "HOLD_AGENT_THRESHOLD","SUCCESS_RADIUS","SUCCESS_RADIUS_EASY","SUCCESS_RADIUS_HARD",
+        # reward & termination shaping
+        "SUCCESS_BONUS","STAY_NEAR_BONUS","TIME_PENALTY_COEF",
+        "SUCCESS_HOLD_SIMSTEPS","HOLD_AGENT_THRESHOLD","SUCCESS_RADIUS","SUCCESS_RADIUS_MIN",
+        "SUCCESS_RADIUS_EASY","SUCCESS_RADIUS_HARD",
+        # curriculum & target
         "AUTO_CURRICULUM","AUTO_CURRICULUM_MODE","CURRICULUM_WINDOW","CURRICULUM_STEP_UP",
-        "CURRICULUM_STEP_DOWN","CURRICULUM_UP_THRESH","CURRICULUM_DOWN_THRESH","TARGET_OFFSET_EASY",
-        "TARGET_OFFSET_HARD","EPISODE_SECONDS","KP","KD","ACTION_SCALE","DELTA_FRAC"
+        "CURRICULUM_STEP_DOWN","CURRICULUM_UP_THRESH","CURRICULUM_DOWN_THRESH",
+        "TARGET_OFFSET_EASY","TARGET_OFFSET_HARD",
+        # control & horizon
+        "EPISODE_SECONDS","KP","KD","ACTION_SCALE","DELTA_FRAC",
+        # task toggles & eval
+        "NO_ROLL","NOROLL_MAX_DEG","VEL_SUCCESS_TOL","ANGVEL_SUCCESS_TOL",
+        "EVAL_ONE_EPISODE","EVAL_FREEZE_CURRICULUM","EVAL_RUN_FULL_HORIZON","EVAL_MIN_SECONDS","EVAL_FPS"
     ]:
         if os.environ.get(k) is not None:
-            print(f"   ⚙️ {k}={os.environ.get(k)}")
+            print(f"   {k}={os.environ.get(k)}")
 
     # Run training
     try:
